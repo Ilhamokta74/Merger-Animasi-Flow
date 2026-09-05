@@ -33,10 +33,6 @@ const TEMP_DIR = path.join(__dirname, '.temp');
 
 const VIDEO_EXT = ['.mp4', '.mov', '.mkv', '.avi', '.ts', '.webm', '.m4v'];
 
-// Berapa folder yang boleh diproses bersamaan (paralel).
-// 1 = satu-satu (paling aman & stabil untuk CPU/disk).
-const CONCURRENCY = 1;
-
 // Mode penggabungan (HANYA dipakai kalau FADE.enabled = false):
 //  - 'copy'    : cepat, tanpa re-encode. HANYA aman kalau semua potongan video
 //                dalam satu folder punya codec/resolusi/format yang SAMA
@@ -53,7 +49,7 @@ const MODE = 'copy';
 //  - kalau folder cuma 1 file: tidak ada fade sama sekali
 const FADE = {
   enabled: true,
-  duration: 0.5, // detik, otomatis dikecilkan kalau part-nya lebih pendek dari 2x durasi ini
+  duration: 1, // detik. Ini WAKTU TAMBAHAN di luar video asli (video asli tidak dipotong/diredupkan).
 };
 // =================================================
 
@@ -69,14 +65,48 @@ function getVideoFiles(folderPath) {
     .map((f) => path.join(folderPath, f));
 }
 
-function getDuration(filePath) {
+function getVideoInfo(filePath) {
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(filePath, (err, data) => {
       if (err) return reject(err);
-      resolve(data.format.duration || 0);
+      const duration = data.format.duration || 0;
+      const vStream = (data.streams || []).find((s) => s.codec_type === 'video');
+      resolve({
+        duration,
+        width: (vStream && vStream.width) || 0,
+        height: (vStream && vStream.height) || 0,
+      });
     });
   });
 }
+
+// Pilih resolusi target = resolusi dengan area terbesar di antara semua file
+// dalam folder, supaya kualitas video tidak turun karena upscale/downscale
+// yang tidak perlu.
+function pickTargetResolution(videoInfos) {
+  let best = videoInfos[0];
+  for (const v of videoInfos) {
+    if (v.width * v.height > best.width * best.height) best = v;
+  }
+  return {
+    width: best.width || 1280,
+    height: best.height || 720,
+  };
+}
+
+// Filter untuk menyamakan resolusi setiap video ke ukuran target:
+// video di-scale supaya pas di dalam kotak target (tanpa distorsi), sisa
+// ruang kosong diisi bar hitam (letterbox/pillarbox), lalu SAR diseragamkan.
+function normalizeVideoFilter(targetW, targetH) {
+  return (
+    `scale=w=${targetW}:h=${targetH}:force_original_aspect_ratio=decrease,` +
+    `pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`
+  );
+}
+
+// Filter untuk menyamakan audio (sample rate & channel layout) supaya
+// concat tidak gagal kalau ada part yang audionya beda spek.
+const NORMALIZE_AUDIO_FILTER = 'aformat=sample_rates=48000:channel_layouts=stereo';
 
 function timeToSeconds(str) {
   // format: HH:MM:SS.ms
@@ -119,48 +149,69 @@ function runFfmpeg(args, totalDuration, onProgress) {
 }
 
 async function mergeFolder(folderName, files, bar) {
-  const durations = await Promise.all(files.map(getDuration));
-  const totalDuration = durations.reduce((a, b) => a + b, 0) || 1;
-  bar.setTotal(Math.round(totalDuration));
-  bar.update(0, { status: 'memproses' });
+  const videoInfos = await Promise.all(files.map(getVideoInfo));
+  const durations = videoInfos.map((v) => v.duration);
+  const baseDuration = durations.reduce((a, b) => a + b, 0) || 1;
 
   const outputPath = path.join(OUTPUT_DIR, `${folderName}.mp4`);
   const listPath = path.join(TEMP_DIR, `${folderName}.txt`);
   buildConcatList(files, listPath);
 
+  if (FADE.enabled && files.length > 1) {
+    bar.setTotal(Math.round(baseDuration)); // sementara, diupdate lagi begitu tahu durasi final
+    bar.update(0, { status: 'memproses' });
+    const onProgress = (sec) => bar.update(Math.round(sec));
+    await fadeMerge(files, videoInfos, outputPath, bar, onProgress);
+    bar.update(bar.getTotal(), { status: 'selesai' });
+    return outputPath;
+  }
+
+  bar.setTotal(Math.round(baseDuration));
+  bar.update(0, { status: 'memproses' });
   const onProgress = (sec) => bar.update(Math.round(sec));
 
-  if (FADE.enabled && files.length > 1) {
-    await fadeMerge(files, durations, outputPath, totalDuration, onProgress);
-  } else if (files.length === 1) {
+  if (files.length === 1) {
     // cuma 1 file, tidak perlu digabung ataupun di-fade, cukup copy
-    await runFfmpeg(['-y', '-i', files[0], '-c', 'copy', outputPath], totalDuration, onProgress);
+    await runFfmpeg(['-y', '-i', files[0], '-c', 'copy', outputPath], baseDuration, onProgress);
   } else if (MODE === 'copy') {
     const args = ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', outputPath];
     try {
-      await runFfmpeg(args, totalDuration, onProgress);
+      await runFfmpeg(args, baseDuration, onProgress);
     } catch (err) {
-      // fallback otomatis ke re-encode kalau stream copy gagal (codec beda-beda)
+      // fallback otomatis ke re-encode kalau stream copy gagal (codec/resolusi beda-beda)
       bar.update(0, { status: 'fallback re-encode' });
-      await reencodeMerge(files, outputPath, totalDuration, onProgress);
+      await reencodeMerge(files, videoInfos, outputPath, baseDuration, onProgress);
     }
   } else {
-    await reencodeMerge(files, outputPath, totalDuration, onProgress);
+    await reencodeMerge(files, videoInfos, outputPath, baseDuration, onProgress);
   }
 
-  bar.update(Math.round(totalDuration), { status: 'selesai' });
+  bar.update(Math.round(baseDuration), { status: 'selesai' });
   return outputPath;
 }
 
-async function reencodeMerge(files, outputPath, totalDuration, onProgress) {
-  // pakai filter_complex concat: lebih toleran terhadap codec/resolusi berbeda
+async function reencodeMerge(files, videoInfos, outputPath, totalDuration, onProgress) {
+  // pakai filter_complex concat: lebih toleran terhadap codec/resolusi berbeda.
+  // Setiap video dinormalisasi dulu ke resolusi & format audio yang sama
+  // supaya filter concat tidak gagal.
+  const target = pickTargetResolution(videoInfos);
   const inputArgs = files.flatMap((f) => ['-i', f]);
-  const streams = files.map((_, i) => `[${i}:v:0][${i}:a:0]`).join('');
-  const filter = `${streams}concat=n=${files.length}:v=1:a=1[outv][outa]`;
+
+  const filterParts = [];
+  const pairLabels = [];
+  files.forEach((_, i) => {
+    filterParts.push(`[${i}:v]${normalizeVideoFilter(target.width, target.height)}[v${i}]`);
+    filterParts.push(`[${i}:a]${NORMALIZE_AUDIO_FILTER}[a${i}]`);
+    pairLabels.push(`[v${i}][a${i}]`);
+  });
+
+  const concatFilter = `${pairLabels.join('')}concat=n=${files.length}:v=1:a=1[outv][outa]`;
+  const filterComplex = `${filterParts.join(';')};${concatFilter}`;
+
   const args = [
     '-y',
     ...inputArgs,
-    '-filter_complex', filter,
+    '-filter_complex', filterComplex,
     '-map', '[outv]',
     '-map', '[outa]',
     '-c:v', 'libx264',
@@ -170,42 +221,66 @@ async function reencodeMerge(files, outputPath, totalDuration, onProgress) {
   await runFfmpeg(args, totalDuration, onProgress);
 }
 
-async function fadeMerge(files, durations, outputPath, totalDuration, onProgress) {
+/**
+ * Menggabungkan dengan fade TANPA meredupkan video asli:
+ * video tiap part diputar penuh dulu, baru setelah itu ditambah waktu ekstra
+ * (frame terakhir dibekukan) yang di-fade. Sebaliknya di awal part, frame
+ * pertama dibekukan lalu di-fade-in SEBELUM konten asli mulai diputar.
+ * Jadi durasi hasil akhir sedikit lebih panjang dari total durasi asli.
+ */
+async function fadeMerge(files, videoInfos, outputPath, bar, onProgress) {
   const n = files.length;
+  const durations = videoInfos.map((v) => v.duration);
+  const target = pickTargetResolution(videoInfos);
   const inputArgs = files.flatMap((f) => ['-i', f]);
+  const fd = FADE.duration;
 
   const filterParts = [];
   const pairLabels = [];
+  let totalExtended = 0;
 
   files.forEach((_, i) => {
     const dur = durations[i] || 0;
     const isFirst = i === 0;
     const isLast = i === n - 1;
 
-    // fade tidak boleh lebih panjang dari setengah durasi clip-nya,
-    // biar fade-in dan fade-out (kalau ada keduanya) tidak saling tabrakan
-    const fd = Math.max(0.05, Math.min(FADE.duration, dur / 2 - 0.05));
+    const startPad = isFirst ? 0 : fd;
+    const endPad = isLast ? 0 : fd;
+    const newDur = dur + startPad + endPad;
+    totalExtended += newDur;
 
-    const vf = [];
-    const af = [];
+    // semua video dinormalisasi dulu ke resolusi & format audio yang sama
+    // supaya concat tidak gagal walau part-nya beda resolusi/spek audio
+    const vf = [normalizeVideoFilter(target.width, target.height)];
+    const af = [NORMALIZE_AUDIO_FILTER];
 
-    if (!isFirst) {
-      vf.push(`fade=t=in:st=0:d=${fd.toFixed(3)}`);
-      af.push(`afade=t=in:st=0:d=${fd.toFixed(3)}`);
+    if (startPad > 0 || endPad > 0) {
+      const tpadOpts = [];
+      if (startPad > 0) tpadOpts.push(`start_mode=clone`, `start_duration=${startPad.toFixed(3)}`);
+      if (endPad > 0) tpadOpts.push(`stop_mode=clone`, `stop_duration=${endPad.toFixed(3)}`);
+      vf.push(`tpad=${tpadOpts.join(':')}`);
     }
-    if (!isLast) {
-      const st = Math.max(0, dur - fd);
-      vf.push(`fade=t=out:st=${st.toFixed(3)}:d=${fd.toFixed(3)}`);
-      af.push(`afade=t=out:st=${st.toFixed(3)}:d=${fd.toFixed(3)}`);
+    if (startPad > 0) {
+      vf.push(`fade=t=in:st=0:d=${startPad.toFixed(3)}`);
+      af.push(`adelay=${Math.round(startPad * 1000)}:all=1`);
+      af.push(`afade=t=in:st=0:d=${startPad.toFixed(3)}`);
+    }
+    if (endPad > 0) {
+      af.push(`apad=pad_dur=${endPad.toFixed(3)}`);
+      const st = dur + startPad;
+      vf.push(`fade=t=out:st=${st.toFixed(3)}:d=${endPad.toFixed(3)}`);
+      af.push(`afade=t=out:st=${st.toFixed(3)}:d=${endPad.toFixed(3)}`);
     }
 
-    const vChain = vf.length ? vf.join(',') : 'null';
-    const aChain = af.length ? af.join(',') : 'anull';
+    const vChain = vf.join(',');
+    const aChain = af.join(',');
 
     filterParts.push(`[${i}:v]${vChain}[v${i}]`);
     filterParts.push(`[${i}:a]${aChain}[a${i}]`);
     pairLabels.push(`[v${i}][a${i}]`);
   });
+
+  bar.setTotal(Math.round(totalExtended));
 
   const concatFilter = `${pairLabels.join('')}concat=n=${n}:v=1:a=1[outv][outa]`;
   const filterComplex = `${filterParts.join(';')};${concatFilter}`;
@@ -221,7 +296,7 @@ async function fadeMerge(files, durations, outputPath, totalDuration, onProgress
     outputPath,
   ];
 
-  await runFfmpeg(args, totalDuration, onProgress);
+  await runFfmpeg(args, totalExtended, onProgress);
 }
 
 async function main() {
@@ -243,51 +318,48 @@ async function main() {
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   fs.mkdirSync(TEMP_DIR, { recursive: true });
 
-  const multibar = new cliProgress.MultiBar(
-    {
-      clearOnComplete: false,
-      hideCursor: true,
-      format: '{folder} |{bar}| {percentage}% | {value}s/{total}s | ETA: {eta_formatted} | {status}',
-    },
-    cliProgress.Presets.shades_classic
-  );
-
   const tasks = folders
-    .map((folderName) => {
-      const folderPath = path.join(INPUT_DIR, folderName);
-      const files = getVideoFiles(folderPath);
-      const bar = multibar.create(100, 0, {
-        folder: folderName.padEnd(20).slice(0, 20),
-        status: 'menunggu',
-      });
-      return { folderName, files, bar };
-    })
+    .map((folderName) => ({
+      folderName,
+      files: getVideoFiles(path.join(INPUT_DIR, folderName)),
+    }))
     .filter((t) => {
       if (t.files.length === 0) {
-        t.bar.update(0, { status: 'dilewati (kosong)' });
-        t.bar.stop();
+        console.log(`Folder "${t.folderName}" dilewati (tidak ada video).`);
         return false;
       }
       return true;
     });
 
   const errors = [];
-  let idx = 0;
+  const total = tasks.length;
 
-  async function worker() {
-    while (idx < tasks.length) {
-      const task = tasks[idx++];
-      try {
-        await mergeFolder(task.folderName, task.files, task.bar);
-      } catch (err) {
-        task.bar.update(0, { status: 'GAGAL' });
-        errors.push({ folder: task.folderName, error: err.message });
-      }
+  // Diproses satu per satu (sequential), bukan sekaligus.
+  // Progress bar untuk folder berikutnya baru muncul setelah folder
+  // sebelumnya selesai.
+  for (let i = 0; i < total; i++) {
+    const task = tasks[i];
+    console.log(`\n[${i + 1}/${total}] ${task.folderName}`);
+
+    const bar = new cliProgress.SingleBar(
+      {
+        clearOnComplete: false,
+        hideCursor: true,
+        format: '  |{bar}| {percentage}% | {value}s/{total}s | ETA: {eta_formatted} | {status}',
+      },
+      cliProgress.Presets.shades_classic
+    );
+    bar.start(100, 0, { status: 'memproses' });
+
+    try {
+      await mergeFolder(task.folderName, task.files, bar);
+    } catch (err) {
+      bar.update(0, { status: 'GAGAL' });
+      errors.push({ folder: task.folderName, error: err.message });
+    } finally {
+      bar.stop();
     }
   }
-
-  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-  multibar.stop();
 
   fs.rmSync(TEMP_DIR, { recursive: true, force: true });
 

@@ -64,7 +64,19 @@ Judul B              |░░░░░░░░░░░░░░░░░░░�
 - `CONCURRENCY` — jumlah folder yang diproses bersamaan. Default `1`
   (satu-satu, paling stabil). Naikkan kalau CPU/disk kamu kuat dan mau lebih
   cepat memproses banyak judul sekaligus.
-- `MODE`:
+- `FADE` — fade in/out otomatis antar part dalam satu folder:
+  - `enabled: true` (default) — part pertama hanya fade-out di akhir, part
+    terakhir hanya fade-in di awal, part di tengah dapat fade-in DAN
+    fade-out. Kalau folder cuma berisi 1 file, tidak ada fade sama sekali.
+    Video aslinya **diputar penuh dulu tanpa diredupkan sama sekali** —
+    fade dilakukan dengan menambah waktu ekstra (frame terakhir/pertama
+    dibekukan lalu difade), jadi durasi hasil akhir sedikit lebih panjang
+    dari total durasi asli (bertambah `duration` detik per sisi fade).
+    Mode ini SELALU re-encode (butuh proses ulang gambar+audio), jadi lebih
+    lambat dari mode copy.
+  - `duration: 1` — lama tambahan waktu fade dalam detik di tiap sisi.
+  - `enabled: false` — matikan fade sepenuhnya, kembali pakai `MODE` di bawah.
+- `MODE` (hanya dipakai kalau `FADE.enabled = false`):
   - `'copy'` (default) — cepat, tanpa re-encode ulang. Cocok kalau semua
     potongan video dalam satu folder punya codec/resolusi/format yang sama
     (misalnya semua berasal dari kamera/rekaman yang sama). Kalau gagal

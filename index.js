@@ -37,12 +37,24 @@ const VIDEO_EXT = ['.mp4', '.mov', '.mkv', '.avi', '.ts', '.webm', '.m4v'];
 // 1 = satu-satu (paling aman & stabil untuk CPU/disk).
 const CONCURRENCY = 1;
 
-// Mode penggabungan:
+// Mode penggabungan (HANYA dipakai kalau FADE.enabled = false):
 //  - 'copy'    : cepat, tanpa re-encode. HANYA aman kalau semua potongan video
 //                dalam satu folder punya codec/resolusi/format yang SAMA
 //                (misal semua hasil rekaman dari sumber yang sama).
 //  - 'reencode': lebih lambat tapi aman walau codec/resolusi berbeda-beda.
 const MODE = 'copy';
+
+// Fade in/out antar part. Kalau enabled = true, penggabungan SELALU re-encode
+// (fade butuh proses ulang gambar & audio, tidak bisa stream-copy).
+// Aturan otomatis per folder:
+//  - part pertama : hanya fade-out di akhir
+//  - part terakhir: hanya fade-in di awal
+//  - part di tengah: fade-in di awal DAN fade-out di akhir
+//  - kalau folder cuma 1 file: tidak ada fade sama sekali
+const FADE = {
+  enabled: true,
+  duration: 1, // detik. Ini WAKTU TAMBAHAN di luar video asli (video asli tidak dipotong/diredupkan).
+};
 // =================================================
 
 function naturalSort(a, b) {
@@ -108,30 +120,42 @@ function runFfmpeg(args, totalDuration, onProgress) {
 
 async function mergeFolder(folderName, files, bar) {
   const durations = await Promise.all(files.map(getDuration));
-  const totalDuration = durations.reduce((a, b) => a + b, 0) || 1;
-  bar.setTotal(Math.round(totalDuration));
-  bar.update(0, { status: 'memproses' });
+  const baseDuration = durations.reduce((a, b) => a + b, 0) || 1;
 
   const outputPath = path.join(OUTPUT_DIR, `${folderName}.mp4`);
   const listPath = path.join(TEMP_DIR, `${folderName}.txt`);
   buildConcatList(files, listPath);
 
+  if (FADE.enabled && files.length > 1) {
+    bar.setTotal(Math.round(baseDuration)); // sementara, diupdate lagi begitu tahu durasi final
+    bar.update(0, { status: 'memproses' });
+    const onProgress = (sec) => bar.update(Math.round(sec));
+    await fadeMerge(files, durations, outputPath, bar, onProgress);
+    bar.update(bar.getTotal(), { status: 'selesai' });
+    return outputPath;
+  }
+
+  bar.setTotal(Math.round(baseDuration));
+  bar.update(0, { status: 'memproses' });
   const onProgress = (sec) => bar.update(Math.round(sec));
 
-  if (MODE === 'copy') {
+  if (files.length === 1) {
+    // cuma 1 file, tidak perlu digabung ataupun di-fade, cukup copy
+    await runFfmpeg(['-y', '-i', files[0], '-c', 'copy', outputPath], baseDuration, onProgress);
+  } else if (MODE === 'copy') {
     const args = ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', outputPath];
     try {
-      await runFfmpeg(args, totalDuration, onProgress);
+      await runFfmpeg(args, baseDuration, onProgress);
     } catch (err) {
       // fallback otomatis ke re-encode kalau stream copy gagal (codec beda-beda)
       bar.update(0, { status: 'fallback re-encode' });
-      await reencodeMerge(files, outputPath, totalDuration, onProgress);
+      await reencodeMerge(files, outputPath, baseDuration, onProgress);
     }
   } else {
-    await reencodeMerge(files, outputPath, totalDuration, onProgress);
+    await reencodeMerge(files, outputPath, baseDuration, onProgress);
   }
 
-  bar.update(Math.round(totalDuration), { status: 'selesai' });
+  bar.update(Math.round(baseDuration), { status: 'selesai' });
   return outputPath;
 }
 
@@ -151,6 +175,80 @@ async function reencodeMerge(files, outputPath, totalDuration, onProgress) {
     outputPath,
   ];
   await runFfmpeg(args, totalDuration, onProgress);
+}
+
+/**
+ * Menggabungkan dengan fade TANPA meredupkan video asli:
+ * video tiap part diputar penuh dulu, baru setelah itu ditambah waktu ekstra
+ * (frame terakhir dibekukan) yang di-fade. Sebaliknya di awal part, frame
+ * pertama dibekukan lalu di-fade-in SEBELUM konten asli mulai diputar.
+ * Jadi durasi hasil akhir sedikit lebih panjang dari total durasi asli.
+ */
+async function fadeMerge(files, durations, outputPath, bar, onProgress) {
+  const n = files.length;
+  const inputArgs = files.flatMap((f) => ['-i', f]);
+  const fd = FADE.duration;
+
+  const filterParts = [];
+  const pairLabels = [];
+  let totalExtended = 0;
+
+  files.forEach((_, i) => {
+    const dur = durations[i] || 0;
+    const isFirst = i === 0;
+    const isLast = i === n - 1;
+
+    const startPad = isFirst ? 0 : fd;
+    const endPad = isLast ? 0 : fd;
+    const newDur = dur + startPad + endPad;
+    totalExtended += newDur;
+
+    const vf = [];
+    const af = [];
+
+    if (startPad > 0 || endPad > 0) {
+      const tpadOpts = [];
+      if (startPad > 0) tpadOpts.push(`start_mode=clone`, `start_duration=${startPad.toFixed(3)}`);
+      if (endPad > 0) tpadOpts.push(`stop_mode=clone`, `stop_duration=${endPad.toFixed(3)}`);
+      vf.push(`tpad=${tpadOpts.join(':')}`);
+    }
+    if (startPad > 0) {
+      vf.push(`fade=t=in:st=0:d=${startPad.toFixed(3)}`);
+      af.push(`adelay=${Math.round(startPad * 1000)}:all=1`);
+      af.push(`afade=t=in:st=0:d=${startPad.toFixed(3)}`);
+    }
+    if (endPad > 0) {
+      af.push(`apad=pad_dur=${endPad.toFixed(3)}`);
+      const st = dur + startPad;
+      vf.push(`fade=t=out:st=${st.toFixed(3)}:d=${endPad.toFixed(3)}`);
+      af.push(`afade=t=out:st=${st.toFixed(3)}:d=${endPad.toFixed(3)}`);
+    }
+
+    const vChain = vf.length ? vf.join(',') : 'null';
+    const aChain = af.length ? af.join(',') : 'anull';
+
+    filterParts.push(`[${i}:v]${vChain}[v${i}]`);
+    filterParts.push(`[${i}:a]${aChain}[a${i}]`);
+    pairLabels.push(`[v${i}][a${i}]`);
+  });
+
+  bar.setTotal(Math.round(totalExtended));
+
+  const concatFilter = `${pairLabels.join('')}concat=n=${n}:v=1:a=1[outv][outa]`;
+  const filterComplex = `${filterParts.join(';')};${concatFilter}`;
+
+  const args = [
+    '-y',
+    ...inputArgs,
+    '-filter_complex', filterComplex,
+    '-map', '[outv]',
+    '-map', '[outa]',
+    '-c:v', 'libx264',
+    '-c:a', 'aac',
+    outputPath,
+  ];
+
+  await runFfmpeg(args, totalExtended, onProgress);
 }
 
 async function main() {

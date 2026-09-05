@@ -53,7 +53,7 @@ const MODE = 'copy';
 //  - kalau folder cuma 1 file: tidak ada fade sama sekali
 const FADE = {
   enabled: true,
-  duration: 1, // detik. Ini WAKTU TAMBAHAN di luar video asli (video asli tidak dipotong/diredupkan).
+  duration: 0.5, // detik, otomatis dikecilkan kalau part-nya lebih pendek dari 2x durasi ini
 };
 // =================================================
 
@@ -120,42 +120,35 @@ function runFfmpeg(args, totalDuration, onProgress) {
 
 async function mergeFolder(folderName, files, bar) {
   const durations = await Promise.all(files.map(getDuration));
-  const baseDuration = durations.reduce((a, b) => a + b, 0) || 1;
+  const totalDuration = durations.reduce((a, b) => a + b, 0) || 1;
+  bar.setTotal(Math.round(totalDuration));
+  bar.update(0, { status: 'memproses' });
 
   const outputPath = path.join(OUTPUT_DIR, `${folderName}.mp4`);
   const listPath = path.join(TEMP_DIR, `${folderName}.txt`);
   buildConcatList(files, listPath);
 
-  if (FADE.enabled && files.length > 1) {
-    bar.setTotal(Math.round(baseDuration)); // sementara, diupdate lagi begitu tahu durasi final
-    bar.update(0, { status: 'memproses' });
-    const onProgress = (sec) => bar.update(Math.round(sec));
-    await fadeMerge(files, durations, outputPath, bar, onProgress);
-    bar.update(bar.getTotal(), { status: 'selesai' });
-    return outputPath;
-  }
-
-  bar.setTotal(Math.round(baseDuration));
-  bar.update(0, { status: 'memproses' });
   const onProgress = (sec) => bar.update(Math.round(sec));
 
-  if (files.length === 1) {
+  if (FADE.enabled && files.length > 1) {
+    await fadeMerge(files, durations, outputPath, totalDuration, onProgress);
+  } else if (files.length === 1) {
     // cuma 1 file, tidak perlu digabung ataupun di-fade, cukup copy
-    await runFfmpeg(['-y', '-i', files[0], '-c', 'copy', outputPath], baseDuration, onProgress);
+    await runFfmpeg(['-y', '-i', files[0], '-c', 'copy', outputPath], totalDuration, onProgress);
   } else if (MODE === 'copy') {
     const args = ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', outputPath];
     try {
-      await runFfmpeg(args, baseDuration, onProgress);
+      await runFfmpeg(args, totalDuration, onProgress);
     } catch (err) {
       // fallback otomatis ke re-encode kalau stream copy gagal (codec beda-beda)
       bar.update(0, { status: 'fallback re-encode' });
-      await reencodeMerge(files, outputPath, baseDuration, onProgress);
+      await reencodeMerge(files, outputPath, totalDuration, onProgress);
     }
   } else {
-    await reencodeMerge(files, outputPath, baseDuration, onProgress);
+    await reencodeMerge(files, outputPath, totalDuration, onProgress);
   }
 
-  bar.update(Math.round(baseDuration), { status: 'selesai' });
+  bar.update(Math.round(totalDuration), { status: 'selesai' });
   return outputPath;
 }
 
@@ -177,51 +170,33 @@ async function reencodeMerge(files, outputPath, totalDuration, onProgress) {
   await runFfmpeg(args, totalDuration, onProgress);
 }
 
-/**
- * Menggabungkan dengan fade TANPA meredupkan video asli:
- * video tiap part diputar penuh dulu, baru setelah itu ditambah waktu ekstra
- * (frame terakhir dibekukan) yang di-fade. Sebaliknya di awal part, frame
- * pertama dibekukan lalu di-fade-in SEBELUM konten asli mulai diputar.
- * Jadi durasi hasil akhir sedikit lebih panjang dari total durasi asli.
- */
-async function fadeMerge(files, durations, outputPath, bar, onProgress) {
+async function fadeMerge(files, durations, outputPath, totalDuration, onProgress) {
   const n = files.length;
   const inputArgs = files.flatMap((f) => ['-i', f]);
-  const fd = FADE.duration;
 
   const filterParts = [];
   const pairLabels = [];
-  let totalExtended = 0;
 
   files.forEach((_, i) => {
     const dur = durations[i] || 0;
     const isFirst = i === 0;
     const isLast = i === n - 1;
 
-    const startPad = isFirst ? 0 : fd;
-    const endPad = isLast ? 0 : fd;
-    const newDur = dur + startPad + endPad;
-    totalExtended += newDur;
+    // fade tidak boleh lebih panjang dari setengah durasi clip-nya,
+    // biar fade-in dan fade-out (kalau ada keduanya) tidak saling tabrakan
+    const fd = Math.max(0.05, Math.min(FADE.duration, dur / 2 - 0.05));
 
     const vf = [];
     const af = [];
 
-    if (startPad > 0 || endPad > 0) {
-      const tpadOpts = [];
-      if (startPad > 0) tpadOpts.push(`start_mode=clone`, `start_duration=${startPad.toFixed(3)}`);
-      if (endPad > 0) tpadOpts.push(`stop_mode=clone`, `stop_duration=${endPad.toFixed(3)}`);
-      vf.push(`tpad=${tpadOpts.join(':')}`);
+    if (!isFirst) {
+      vf.push(`fade=t=in:st=0:d=${fd.toFixed(3)}`);
+      af.push(`afade=t=in:st=0:d=${fd.toFixed(3)}`);
     }
-    if (startPad > 0) {
-      vf.push(`fade=t=in:st=0:d=${startPad.toFixed(3)}`);
-      af.push(`adelay=${Math.round(startPad * 1000)}:all=1`);
-      af.push(`afade=t=in:st=0:d=${startPad.toFixed(3)}`);
-    }
-    if (endPad > 0) {
-      af.push(`apad=pad_dur=${endPad.toFixed(3)}`);
-      const st = dur + startPad;
-      vf.push(`fade=t=out:st=${st.toFixed(3)}:d=${endPad.toFixed(3)}`);
-      af.push(`afade=t=out:st=${st.toFixed(3)}:d=${endPad.toFixed(3)}`);
+    if (!isLast) {
+      const st = Math.max(0, dur - fd);
+      vf.push(`fade=t=out:st=${st.toFixed(3)}:d=${fd.toFixed(3)}`);
+      af.push(`afade=t=out:st=${st.toFixed(3)}:d=${fd.toFixed(3)}`);
     }
 
     const vChain = vf.length ? vf.join(',') : 'null';
@@ -231,8 +206,6 @@ async function fadeMerge(files, durations, outputPath, bar, onProgress) {
     filterParts.push(`[${i}:a]${aChain}[a${i}]`);
     pairLabels.push(`[v${i}][a${i}]`);
   });
-
-  bar.setTotal(Math.round(totalExtended));
 
   const concatFilter = `${pairLabels.join('')}concat=n=${n}:v=1:a=1[outv][outa]`;
   const filterComplex = `${filterParts.join(';')};${concatFilter}`;
@@ -248,7 +221,7 @@ async function fadeMerge(files, durations, outputPath, bar, onProgress) {
     outputPath,
   ];
 
-  await runFfmpeg(args, totalExtended, onProgress);
+  await runFfmpeg(args, totalDuration, onProgress);
 }
 
 async function main() {

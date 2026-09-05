@@ -78,6 +78,48 @@ function getDuration(filePath) {
   });
 }
 
+function getDimensions(filePath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, (err, data) => {
+      if (err) return reject(err);
+      const videoStream = (data.streams || []).find((s) => s.codec_type === 'video');
+      if (!videoStream) return resolve({ width: 0, height: 0 });
+      // rotasi (portrait yang disimpan sebagai landscape + metadata rotate) perlu ditukar
+      const rotation = Math.abs(
+        parseInt(
+          (videoStream.tags && videoStream.tags.rotate) ||
+            (videoStream.side_data_list &&
+              videoStream.side_data_list.find((d) => d.rotation) &&
+              videoStream.side_data_list.find((d) => d.rotation).rotation) ||
+            0,
+          10
+        )
+      );
+      let { width, height } = videoStream;
+      if (rotation === 90 || rotation === 270) {
+        [width, height] = [height, width];
+      }
+      resolve({ width: width || 0, height: height || 0 });
+    });
+  });
+}
+
+// Menentukan resolusi target untuk satu folder: dimensi terbesar yang ditemukan,
+// supaya clip lain di-scale UP/DOWN + di-pad, bukan di-crop.
+function getTargetResolution(dims) {
+  const width = Math.max(...dims.map((d) => d.width || 0));
+  const height = Math.max(...dims.map((d) => d.height || 0));
+  // ffmpeg scale/pad butuh angka genap
+  return {
+    width: width % 2 === 0 ? width : width + 1,
+    height: height % 2 === 0 ? height : height + 1,
+  };
+}
+
+function scalePadFilter(targetW, targetH) {
+  return `scale=w=${targetW}:h=${targetH}:force_original_aspect_ratio=decrease,pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
+}
+
 function timeToSeconds(str) {
   // format: HH:MM:SS.ms
   const [h, m, s] = str.split(':');
@@ -131,7 +173,8 @@ async function mergeFolder(folderName, files, bar) {
   const onProgress = (sec) => bar.update(Math.round(sec));
 
   if (FADE.enabled && files.length > 1) {
-    await fadeMerge(files, durations, outputPath, totalDuration, onProgress);
+    const dims = await Promise.all(files.map(getDimensions));
+    await fadeMerge(files, durations, dims, outputPath, totalDuration, onProgress);
   } else if (files.length === 1) {
     // cuma 1 file, tidak perlu digabung ataupun di-fade, cukup copy
     await runFfmpeg(['-y', '-i', files[0], '-c', 'copy', outputPath], totalDuration, onProgress);
@@ -140,23 +183,32 @@ async function mergeFolder(folderName, files, bar) {
     try {
       await runFfmpeg(args, totalDuration, onProgress);
     } catch (err) {
-      // fallback otomatis ke re-encode kalau stream copy gagal (codec beda-beda)
+      // fallback otomatis ke re-encode kalau stream copy gagal (codec/resolusi beda-beda)
       bar.update(0, { status: 'fallback re-encode' });
-      await reencodeMerge(files, outputPath, totalDuration, onProgress);
+      const dims = await Promise.all(files.map(getDimensions));
+      await reencodeMerge(files, dims, outputPath, totalDuration, onProgress);
     }
   } else {
-    await reencodeMerge(files, outputPath, totalDuration, onProgress);
+    const dims = await Promise.all(files.map(getDimensions));
+    await reencodeMerge(files, dims, outputPath, totalDuration, onProgress);
   }
 
   bar.update(Math.round(totalDuration), { status: 'selesai' });
   return outputPath;
 }
 
-async function reencodeMerge(files, outputPath, totalDuration, onProgress) {
-  // pakai filter_complex concat: lebih toleran terhadap codec/resolusi berbeda
+async function reencodeMerge(files, dims, outputPath, totalDuration, onProgress) {
+  // pakai filter_complex concat: lebih toleran terhadap codec/resolusi berbeda.
+  // Setiap clip di-scale+pad dulu ke resolusi terbesar di folder ini supaya
+  // dimensi semua input sama persis sebelum masuk ke concat (kalau tidak,
+  // ffmpeg akan gagal dengan error "parameters do not match").
+  const { width: targetW, height: targetH } = getTargetResolution(dims);
+  const normFilter = scalePadFilter(targetW, targetH);
+
   const inputArgs = files.flatMap((f) => ['-i', f]);
-  const streams = files.map((_, i) => `[${i}:v:0][${i}:a:0]`).join('');
-  const filter = `${streams}concat=n=${files.length}:v=1:a=1[outv][outa]`;
+  const normParts = files.map((_, i) => `[${i}:v]${normFilter}[v${i}]`);
+  const streams = files.map((_, i) => `[v${i}][${i}:a:0]`).join('');
+  const filter = `${normParts.join(';')};${streams}concat=n=${files.length}:v=1:a=1[outv][outa]`;
   const args = [
     '-y',
     ...inputArgs,
@@ -170,9 +222,15 @@ async function reencodeMerge(files, outputPath, totalDuration, onProgress) {
   await runFfmpeg(args, totalDuration, onProgress);
 }
 
-async function fadeMerge(files, durations, outputPath, totalDuration, onProgress) {
+async function fadeMerge(files, durations, dims, outputPath, totalDuration, onProgress) {
   const n = files.length;
   const inputArgs = files.flatMap((f) => ['-i', f]);
+
+  // Resolusi target folder ini: dimensi terbesar di antara semua clip.
+  // Semua clip di-scale+pad ke ukuran ini SEBELUM fade & concat, karena
+  // concat mensyaratkan dimensi persis sama di semua input.
+  const { width: targetW, height: targetH } = getTargetResolution(dims);
+  const normFilter = scalePadFilter(targetW, targetH);
 
   const filterParts = [];
   const pairLabels = [];
@@ -186,7 +244,7 @@ async function fadeMerge(files, durations, outputPath, totalDuration, onProgress
     // biar fade-in dan fade-out (kalau ada keduanya) tidak saling tabrakan
     const fd = Math.max(0.05, Math.min(FADE.duration, dur / 2 - 0.05));
 
-    const vf = [];
+    const vf = [normFilter];
     const af = [];
 
     if (!isFirst) {
@@ -199,7 +257,7 @@ async function fadeMerge(files, durations, outputPath, totalDuration, onProgress
       af.push(`afade=t=out:st=${st.toFixed(3)}:d=${fd.toFixed(3)}`);
     }
 
-    const vChain = vf.length ? vf.join(',') : 'null';
+    const vChain = vf.join(',');
     const aChain = af.length ? af.join(',') : 'anull';
 
     filterParts.push(`[${i}:v]${vChain}[v${i}]`);

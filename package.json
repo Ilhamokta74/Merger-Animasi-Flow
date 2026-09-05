@@ -1,0 +1,14 @@
+{
+  "name": "video-merger",
+  "version": "1.0.0",
+  "description": "Merge potongan video per folder di dalam input/, dengan progress bar & ETA per judul",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "fluent-ffmpeg": "^2.1.3",
+    "cli-progress": "^3.12.0"
+  }
+}

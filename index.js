@@ -14,7 +14,8 @@
  *   output/Judul A.mp4
  *   output/Judul B.mp4
  *
- * Menampilkan progress bar + ETA per folder (judul) selama proses merge berjalan.
+ * Folder diproses satu per satu (berurutan), dengan satu progress bar + ETA
+ * dan penanda urutan seperti [3/100].
  *
  * Kebutuhan: ffmpeg harus sudah terinstall di sistem dan ada di PATH.
  * Cek dengan: ffmpeg -version
@@ -33,9 +34,9 @@ const TEMP_DIR = path.join(__dirname, '.temp');
 
 const VIDEO_EXT = ['.mp4', '.mov', '.mkv', '.avi', '.ts', '.webm', '.m4v'];
 
-// Berapa folder yang boleh diproses bersamaan (paralel).
-// 1 = satu-satu (paling aman & stabil untuk CPU/disk).
-const CONCURRENCY = 1;
+// Lewati folder yang hasil merge-nya sudah ada di output/
+// (bisa lanjut kalau script terhenti di tengah jalan)
+const SKIP_EXISTING = true;
 
 // Mode penggabungan (HANYA dipakai kalau FADE.enabled = false):
 //  - 'copy'    : cepat, tanpa re-encode. HANYA aman kalau semua potongan video
@@ -301,51 +302,52 @@ async function main() {
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   fs.mkdirSync(TEMP_DIR, { recursive: true });
 
-  const multibar = new cliProgress.MultiBar(
-    {
-      clearOnComplete: false,
-      hideCursor: true,
-      format: '{folder} |{bar}| {percentage}% | {value}s/{total}s | ETA: {eta_formatted} | {status}',
-    },
-    cliProgress.Presets.shades_classic
-  );
+  const errors = [];
+  const total = folders.length;
 
-  const tasks = folders
-    .map((folderName) => {
-      const folderPath = path.join(INPUT_DIR, folderName);
-      const files = getVideoFiles(folderPath);
-      const bar = multibar.create(100, 0, {
-        folder: folderName.padEnd(20).slice(0, 20),
-        status: 'menunggu',
-      });
-      return { folderName, files, bar };
-    })
-    .filter((t) => {
-      if (t.files.length === 0) {
-        t.bar.update(0, { status: 'dilewati (kosong)' });
-        t.bar.stop();
-        return false;
-      }
-      return true;
+  // Proses berurutan, satu folder selesai dulu baru lanjut ke berikutnya
+  for (let i = 0; i < total; i++) {
+    const folderName = folders[i];
+    const counter = `[${i + 1}/${total}]`;
+    const files = getVideoFiles(path.join(INPUT_DIR, folderName));
+    const outputPath = path.join(OUTPUT_DIR, `${folderName}.mp4`);
+
+    if (files.length === 0) {
+      console.log(`${counter} ${folderName} -> dilewati (kosong)`);
+      continue;
+    }
+
+    if (SKIP_EXISTING && fs.existsSync(outputPath)) {
+      console.log(`${counter} ${folderName} -> dilewati (sudah ada di output)`);
+      continue;
+    }
+
+    // SATU bar saja, dibuat baru untuk tiap folder
+    const bar = new cliProgress.SingleBar(
+      {
+        clearOnComplete: false,
+        hideCursor: true,
+        format: '{counter} {folder} |{bar}| {percentage}% | {value}s/{total}s | ETA: {eta_formatted} | {status}',
+      },
+      cliProgress.Presets.shades_classic
+    );
+    bar.start(100, 0, {
+      counter,
+      folder: folderName.padEnd(20).slice(0, 20),
+      status: 'menunggu',
     });
 
-  const errors = [];
-  let idx = 0;
-
-  async function worker() {
-    while (idx < tasks.length) {
-      const task = tasks[idx++];
-      try {
-        await mergeFolder(task.folderName, task.files, task.bar);
-      } catch (err) {
-        task.bar.update(0, { status: 'GAGAL' });
-        errors.push({ folder: task.folderName, error: err.message });
-      }
+    try {
+      await mergeFolder(folderName, files, bar);
+      bar.stop();
+    } catch (err) {
+      bar.update(0, { status: 'GAGAL' });
+      bar.stop();
+      // hapus file output yang setengah jadi supaya tidak ikut ter-skip saat dijalankan ulang
+      fs.rmSync(outputPath, { force: true });
+      errors.push({ folder: folderName, error: err.message });
     }
   }
-
-  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-  multibar.stop();
 
   fs.rmSync(TEMP_DIR, { recursive: true, force: true });
 

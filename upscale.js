@@ -164,7 +164,7 @@ function aiUpscaleFrames(framesDir, outDir) {
       const eta = fps > 0 ? Math.round((total - done) / fps) : 0;
       process.stdout.write(
         `\r  AI upscale: ${done}/${total} frame (${((done / total) * 100).toFixed(1)}%) | ` +
-          `${fps.toFixed(2)} frame/dtk | sisa ~${Math.floor(eta / 60)}m ${eta % 60}s   `
+        `${fps.toFixed(2)} frame/dtk | sisa ~${Math.floor(eta / 60)}m ${eta % 60}s   `
       );
     }, 2000);
 
@@ -172,15 +172,21 @@ function aiUpscaleFrames(framesDir, outDir) {
     let gpuLogged = false;
     let stderrBuf = '';
     proc.stderr.on('data', (chunk) => {
-      if (gpuLogged) return;
-      stderrBuf += chunk.toString();
-      const lines = stderrBuf.split(/\r?\n/).filter((l) => /^\[\d+ .+\]/.test(l.trim()));
-      if (lines.length > 0 && stderrBuf.length > 200) {
-        gpuLogged = true;
-        console.log('\n  GPU terdeteksi:');
-        lines.forEach((l) => console.log(`    ${l.trim().split('  ')[0]}`));
-      }
+      if (!gpuLogged) stderrBuf += chunk.toString();
     });
+    // Tunggu 4 detik supaya semua baris inisialisasi GPU sudah masuk
+    setTimeout(() => {
+      if (gpuLogged) return;
+      gpuLogged = true;
+      const names = new Set();
+      for (const l of stderrBuf.split(/\r?\n/)) {
+        const m = l.trim().match(/^\[(\d+) ([^\]]+)\]/);
+        if (m) names.add(`[${m[1]}] ${m[2]}`);
+      }
+      console.log('\n  GPU terdeteksi oleh Real-ESRGAN:');
+      if (names.size === 0) console.log('    (tidak ada info GPU di log)');
+      names.forEach((n) => console.log(`    ${n}`));
+    }, 4000);
     proc.on('error', (err) => {
       clearInterval(timer);
       reject(new Error(`Gagal menjalankan Real-ESRGAN (${REALESRGAN_BIN}): ${err.message}`));
@@ -267,8 +273,8 @@ async function main() {
   if (!fs.existsSync(REALESRGAN_BIN)) {
     console.error(
       `Real-ESRGAN tidak ditemukan di:\n  ${REALESRGAN_BIN}\n\n` +
-        'Unduh versi ncnn-vulkan dari https://github.com/xinntao/Real-ESRGAN/releases\n' +
-        'lalu extract ke folder "realesrgan" di sebelah script ini.'
+      'Unduh versi ncnn-vulkan dari https://github.com/xinntao/Real-ESRGAN/releases\n' +
+      'lalu extract ke folder "realesrgan" di sebelah script ini.'
     );
     process.exit(1);
   }
@@ -282,8 +288,7 @@ async function main() {
   }
 
   console.log(
-    `Ditemukan ${files.length} video. Mode: ${
-      FORCE_SIZE ? `manual ${FORCED_WIDTH}x${FORCED_HEIGHT}` : 'otomatis (portrait/landscape)'
+    `Ditemukan ${files.length} video. Mode: ${FORCE_SIZE ? `manual ${FORCED_WIDTH}x${FORCED_HEIGHT}` : 'otomatis (portrait/landscape)'
     } | Model: ${MODEL} x${AI_SCALE}\n`
   );
 
